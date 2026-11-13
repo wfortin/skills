@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+"""pr-babysit: read and watch one GitHub pull request for an agent babysitting it.
+
+  pr-babysit status <pr> [--repo owner/name]
+  pr-babysit wait   <pr> [--repo owner/name] [--until ready|green|any-change]
+                         [--timeout SECONDS] [--interval SECONDS] [--settle SECONDS]
+                         [--ignore-check REGEX]... [--required-only]
+
+<pr> is a PR number or a PR URL. Without --repo, the repo comes from the URL or
+from the current checkout. Needs only python3 and an authenticated `gh`.
+
+status
+  Prints the PR as it is now: failing and pending checks with their job ids,
+  where Copilot, Claude, and Codex stand on the head commit, every unresolved
+  review thread with the id needed to reply to or resolve it, and recent
+  top-level comments. Use it to triage before you wait, and after each wake.
+
+wait
+  Polls the PR and prints one line per real event on stdout, so a monitor or a
+  background command wakes the agent once per event. Progress goes to stderr.
+
+  --until ready       (default) every gating check passed on the head, no review
+                      bot is still working on the head, and no unresolved thread
+                      is waiting on a reply from you
+  --until green       gating checks only
+  --until any-change  stop after the first poll that prints an event
+
+  Gating checks are every check on the head except the review bots' own checks,
+  checks matched by --ignore-check, and, with --required-only, checks the base
+  branch does not require.
+
+Exit codes
+  0  the --until condition is met, or the PR merged
+  1  you need to act: a gating check failed or was cancelled, the branch
+     conflicts with its base, the PR closed, unresolved threads wait on you, or
+     GitHub stayed unreachable
+  2  bad arguments, unknown PR, or another watcher already holds this PR
+  3  --timeout passed with nothing to act on; run the same command again
+
+Events
+  - a gating check failed or was cancelled (name, job id, link)
+  - all checks finished on the head (one summary line)
+  - a new comment, review, review thread, or thread reply from anyone other
+    than you (the PR author or the gh user), bots included
+  - Copilot, Claude, or Codex finished reviewing the head
+  - the base branch moved and the new commits touch files in this PR
+  - merge state became BEHIND or DIRTY
+  - the PR merged or closed
+
+Top-level comments from other bots (CI, deploy, Linear, ...) are skipped
+because checks carry that news. Comment edits are never events.
+
+State lives in $XDG_STATE_HOME/pr-babysit (default ~/.local/state/pr-babysit).
+A per-PR lock makes a second watcher exit at once. The state file lets a
+restarted watcher report what arrived while no watcher ran. The first run for
+a PR records what already exists and reports only what comes after; read the
+existing state with `status`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, NoReturn
+
+# Review bots, matched as substrings of a login or check name.
+REVIEW_BOTS = ("copilot", "claude", "codex")
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "pr-babysit"
+# An older state file describes an old session. Start a fresh baseline instead
+# of replaying hours of comments as new events.
+STALE_STATE_SECONDS = 6 * 3600
+MAX_FAILED_POLLS = 10
+TRANSIENT = re.compile(
+    r"HTTP (5\d\d|429)|rate limit|timed? ?out|connection (reset|refused)|EOF|"
+    r"temporar|could not resolve host|TLS handshake|Something went wrong",
+    re.IGNORECASE,
+)
+FAILED = ("fail", "cancel")
+RANK = {"fail": 4, "cancel": 3, "pending": 2, "pass": 1, "skipping": 0}
+CLAUDE_MANUAL = re.compile(r"configured for manual code reviews", re.IGNORECASE)
+CODEX_STATE = re.compile(r"<!--\s*codex-review-state:v1\s*(\{.*?\})\s*-->", re.DOTALL)
+
+QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      url number title state isDraft headRefName headRefOid baseRefName
+      mergeStateStatus reviewDecision
+      author { login }
+      baseRef { target { oid } }
+      reviewRequests(first: 30) {
+        nodes { requestedReviewer { __typename ... on Bot { login } ... on User { login } ... on Team { name } } }
+      }
+      comments(last: 100) { nodes { id url body createdAt author { login __typename } } }
+      reviews(last: 100) {
+        nodes { id url state body createdAt commit { oid } author { login __typename } }
+      }
+      reviewThreads(last: 100) {
+        nodes {
+          id isResolved isOutdated path line
+          comments(first: 100) { nodes { id url body createdAt author { login __typename } } }
+        }
+      }
+    }
+  }
+}
+"""
+
+Json = dict[str, Any]
+
+
+class GhError(Exception):
+    def __init__(self, message: str, transient: bool) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
+def log(message: str) -> None:
+    print(f"pr-babysit: {message}", file=sys.stderr, flush=True)
+
+
+def fail(message: str, code: int = 2) -> NoReturn:
+    # Fatal messages go to stdout so a monitor shows the agent why it stopped.
+    print(f"pr-babysit: {message}", flush=True)
+    sys.exit(code)
+
+
+def gh(args: list[str], allow: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[str]:
+    """Run gh. Retries transient failures (HTTP 5xx or 429, network) with backoff."""
+    delay = 2
+    for attempt in range(5):
+        proc = subprocess.run(["gh", *args], capture_output=True, text=True)
+        transient = proc.returncode != 0 and bool(TRANSIENT.search(proc.stderr))
+        if not transient and proc.returncode in allow:
+            return proc
+        lines = proc.stderr.strip().splitlines()
+        message = lines[-1] if lines else f"gh exited {proc.returncode}"
+        if not transient or attempt == 4:
+            raise GhError(message, transient)
+        log(f"gh {' '.join(args[:2])}: {message}; retry in {delay}s")
+        time.sleep(delay)
+        delay *= 2
+    raise AssertionError("unreachable")
+
+
+def gh_lines(args: list[str]) -> list[str]:
+    return [line for line in gh(args).stdout.splitlines() if line]
+
+
+def bot_of(text: str | None) -> str | None:
+    """Which review bot a login or check name belongs to, if any."""
+    lowered = (text or "").lower()
+    return next((bot for bot in REVIEW_BOTS if bot in lowered), None)
+
+
+def who(node: Json) -> tuple[str, bool]:
+    author = node.get("author") or {}
+    return author.get("login") or "ghost", author.get("__typename") == "Bot"
+
+
+def review_bot(node: Json) -> str | None:
+    login, is_bot = who(node)
+    return bot_of(login) if is_bot else None
+
+
+def plain(body: str) -> str:
+    body = re.sub(r"<!--.*?-->", " ", body or "", flags=re.DOTALL)
+    body = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", body)  # badge images
+    return html.unescape(re.sub(r"<[^>]+>", " ", body))
+
+
+def snippet(body: str, limit: int = 140) -> str:
+    text = re.sub(r"\s+", " ", plain(body)).strip()
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def severity(body: str) -> str:
+    """Severity tag a review bot put on a finding, if any."""
+    badge = re.search(r"\b(P[0-3])[ -]Badge|badge/(P[0-3])-", body or "")
+    if badge:
+        return badge.group(1) or badge.group(2)
+    for mark, name in (("🔴", "important"), ("🟡", "nit"), ("🟣", "pre-existing")):
+        if (body or "").lstrip().startswith(mark):
+            return name
+    return ""
+
+
+def job_ref(link: str) -> str:
+    """'job <id>' for a GitHub Actions check link, for `gh run view --job`."""
+    match = re.search(r"/job/(\d+)", link or "") or re.search(r"/runs/(\d+)$", link or "")
+    return f"job {match.group(1)}" if match else ""
+
+
+def parse_target(raw: str | None, repo: str | None) -> tuple[str, int]:
+    if raw is None or not raw.strip():
+        fail("missing PR number. Did a variable expand to nothing?")
+    url = re.fullmatch(r"https?://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)(?:[/?#]\S*)?", raw.strip())
+    number = re.fullmatch(r"#?(\d+)", raw.strip())
+    if url:
+        repo = repo or url.group(1)
+        pr = int(url.group(2))
+    elif number:
+        pr = int(number.group(1))
+    else:
+        fail(f"'{raw}' is not a PR number or PR URL")
+    if pr <= 0:
+        fail(f"'{raw}' is not a valid PR number")
+    if not repo:
+        try:
+            repo = gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]).stdout.strip()
+        except GhError as error:
+            fail(f"no --repo given and the current directory has no GitHub repo ({error})")
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        fail(f"'{repo}' is not owner/name")
+    return repo, pr
+
+
+def required_checks(repo: str, base: str) -> set[str]:
+    """Required check names for the base branch, from rulesets and classic branch protection."""
+    sources = (
+        (
+            f"repos/{repo}/rules/branches/{base}",
+            '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context',
+        ),
+        (f"repos/{repo}/branches/{base}/protection/required_status_checks", ".contexts[]?, .checks[]?.context"),
+    )
+    names: set[str] = set()
+    for path, jq in sources:
+        try:
+            names.update(gh_lines(["api", path, "--jq", jq]))
+        except GhError as error:
+            if "HTTP 404" not in str(error) and "HTTP 403" not in str(error):
+                log(f"could not read required checks from {path}: {error}")
+    return names
+
+
+class Pr:
+    """One read of the PR: GraphQL data plus checks."""
+
+    def __init__(self, repo: str, number: int) -> None:
+        self.repo, self.number = repo, number
+        owner, name = repo.split("/")
+        proc = gh([
+            "api", "graphql", "-f", f"query={QUERY}",
+            "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={number}",
+        ])
+        data = json.loads(proc.stdout)
+        if data.get("errors") and not (data.get("data") or {}).get("repository"):
+            raise GhError(data["errors"][0].get("message", "GraphQL error"), False)
+        pr = (data["data"]["repository"] or {}).get("pullRequest")
+        if pr is None:
+            raise GhError(f"{repo}#{number} not found", False)
+        self.raw: Json = pr
+        self.viewer: str = data["data"]["viewer"]["login"]
+        self.head: str = pr["headRefOid"]
+        self.short = self.head[:7]
+        self.base: str = pr["baseRefName"]
+        self.base_oid: str | None = ((pr.get("baseRef") or {}).get("target") or {}).get("oid")
+        self.mine = {who(pr)[0], self.viewer}
+        self.comments: list[Json] = pr["comments"]["nodes"]
+        self.reviews: list[Json] = pr["reviews"]["nodes"]
+        self.threads: list[Json] = pr["reviewThreads"]["nodes"]
+        self.checks = self.fetch_checks()
+
+    def fetch_checks(self) -> dict[str, Json]:
+        # gh pr checks exits 8 while checks are pending and 1 when one failed.
+        # Those are states, not errors: read the JSON and ignore the exit code.
+        proc = gh(
+            ["pr", "checks", str(self.number), "-R", self.repo, "--json", "name,bucket,link,description,workflow,startedAt"],
+            allow=(0, 1, 8),
+        )
+        if not proc.stdout.strip():
+            if "no checks reported" in proc.stderr:
+                return {}
+            raise GhError(proc.stderr.strip() or f"gh pr checks exited {proc.returncode}", False)
+        # One name can have several runs (push and pull_request, a cancelled run
+        # superseded by a newer one). Keep the latest; break ties by worst.
+        checks: dict[str, Json] = {}
+        for row in json.loads(proc.stdout):
+            current = checks.get(row["name"])
+            key = (row.get("startedAt") or "", RANK.get(row["bucket"], 2))
+            if current is None or key > (current.get("startedAt") or "", RANK.get(current["bucket"], 2)):
+                checks[row["name"]] = row
+        return checks
+
+    def gate(self, required: set[str], required_only: bool, ignore: list[re.Pattern[str]]) -> set[str]:
+        names = set(required) if required_only and required else set(self.checks) | set(required)
+        return {n for n in names if not bot_of(n) and not any(p.search(n) for p in ignore)}
+
+    def bucket(self, name: str) -> str:
+        return self.checks[name]["bucket"] if name in self.checks else "pending"
+
+    def awaiting_reply(self) -> list[Json]:
+        """Unresolved threads whose last comment is not yours."""
+        out = []
+        for thread in self.threads:
+            nodes = thread["comments"]["nodes"]
+            if not thread["isResolved"] and nodes and who(nodes[-1])[0] not in self.mine:
+                out.append(thread)
+        return out
+
+    def bots(self) -> dict[str, tuple[str, str]]:
+        """State of each review bot on the head: (state, detail).
+
+        state is one of: reviewed, pending, manual, older, absent.
+        """
+        requested = {
+            bot_of((node.get("requestedReviewer") or {}).get("login"))
+            for node in self.raw["reviewRequests"]["nodes"]
+        }
+        result: dict[str, tuple[str, str]] = {}
+        for bot in REVIEW_BOTS:
+            own_checks = [c for n, c in self.checks.items() if bot_of(n) == bot]
+            own_reviews = [r for r in self.reviews if review_bot(r) == bot]
+            real_reviews = [r for r in own_reviews if not CLAUDE_MANUAL.search(r["body"] or "")]
+            on_head = [r for r in real_reviews if (r.get("commit") or {}).get("oid") == self.head]
+            findings = sum(
+                1 for t in self.threads
+                if not t["isResolved"] and t["comments"]["nodes"] and review_bot(t["comments"]["nodes"][0]) == bot
+            )
+            open_findings = f"{findings} unresolved thread{'' if findings == 1 else 's'}"
+
+            codex_state: Json | None = None
+            if bot == "codex":
+                for c in reversed(self.comments):
+                    match = review_bot(c) == "codex" and CODEX_STATE.search(c["body"] or "")
+                    if match:
+                        try:
+                            codex_state = json.loads(match.group(1)).get("code_review") or {}
+                        except ValueError:
+                            pass
+                        break
+
+            if any(c["bucket"] == "pending" for c in own_checks) or bot in requested or (
+                codex_state and codex_state.get("commit_sha") == self.head and codex_state.get("status") != "completed"
+            ):
+                result[bot] = ("pending", f"reviewing {self.short}")
+            elif on_head or (codex_state and codex_state.get("commit_sha") == self.head):
+                result[bot] = ("reviewed", f"reviewed {self.short}; {open_findings}")
+            elif bot == "claude" and own_reviews and not real_reviews:
+                result[bot] = ("manual", "manual mode, not requested on this PR (comment `@claude review` to request)")
+            elif real_reviews or codex_state:
+                last = (real_reviews[-1].get("commit") or {}).get("oid") if real_reviews else codex_state.get("commit_sha")
+                result[bot] = ("older", f"last reviewed {(last or '?')[:7]}, not the head; {open_findings}")
+            elif own_checks:
+                result[bot] = ("reviewed", f"check finished on {self.short}; {open_findings}")
+            else:
+                result[bot] = ("absent", "not seen on this PR")
+        return result
+
+
+def check_line(name: str, check: Json, required: set[str]) -> str:
+    ref = job_ref(check.get("link", ""))
+    tags = ", ".join(filter(None, [check.get("workflow") or "", "required" if name in required else "", ref]))
+    return f"{name} ({tags}) {check.get('link', '')}".replace(" () ", " ")
+
+
+def status(repo: str, number: int) -> None:
+    pr = Pr(repo, number)
+    raw = pr.raw
+    required = required_checks(repo, pr.base)
+    print(f"{repo}#{number} {raw['title']}")
+    print(f"  {raw['url']}")
+    behind = ""
+    if pr.base_oid:
+        try:
+            count = gh(["api", f"repos/{repo}/compare/{pr.base_oid}...{pr.head}", "--jq", ".behind_by"]).stdout.strip()
+            behind = f", {count} behind {pr.base}"
+        except GhError:
+            pass
+    print(
+        f"  state {raw['state']}{' (draft)' if raw['isDraft'] else ''}, head {pr.short} on {raw['headRefName']}"
+        f", base {pr.base}{behind}, merge state {raw['mergeStateStatus']}, review decision {raw['reviewDecision'] or 'none'}"
+    )
+    print(f"  you: {', '.join(sorted(pr.mine))}")
+
+    print("\nchecks:")
+    if not pr.checks:
+        print("  none reported yet")
+    counts: dict[str, int] = {}
+    for c in pr.checks.values():
+        counts[c["bucket"]] = counts.get(c["bucket"], 0) + 1
+    if counts:
+        print("  " + ", ".join(f"{n} {b}" for b, n in sorted(counts.items())))
+    for name in sorted(pr.checks):
+        c = pr.checks[name]
+        if c["bucket"] in FAILED:
+            print(f"  {'FAIL' if c['bucket'] == 'fail' else 'CANCELLED'} {check_line(name, c, required)}")
+    pending = sorted(n for n in set(pr.checks) | required if pr.bucket(n) == "pending")
+    if pending:
+        print(f"  pending: {', '.join(pending)}")
+    if required:
+        print(f"  required: {', '.join(sorted(required))}")
+
+    print(f"\nreview bots on {pr.short}:")
+    for bot, (state, detail) in pr.bots().items():
+        print(f"  {bot}: {state}: {detail}")
+
+    unresolved = [t for t in pr.threads if not t["isResolved"]]
+    waiting = {t["id"] for t in pr.awaiting_reply()}
+    print(f"\nunresolved threads: {len(unresolved)} ({len(waiting)} waiting on you)")
+    for t in unresolved:
+        nodes = t["comments"]["nodes"]
+        first, last = nodes[0], nodes[-1]
+        where = f"{t['path']}:{t['line']}" if t["line"] else t["path"]
+        sev = severity(first["body"])
+        flags = ", ".join(filter(None, [sev, "outdated" if t["isOutdated"] else "", "waiting on you" if t["id"] in waiting else "you replied last"]))
+        print(f"  [{t['id']}] {who(first)[0]} on {where} ({flags})")
+        print(f"      {snippet(first['body'], 300)}")
+        if len(nodes) > 1:
+            print(f"      last reply from {who(last)[0]}: {snippet(last['body'])}")
+        print(f"      {first['url']}")
+
+    reviews = [
+        r for r in pr.reviews
+        if who(r)[0] not in pr.mine and (r["state"] in ("APPROVED", "CHANGES_REQUESTED") or (r["body"] or "").strip())
+        and not CLAUDE_MANUAL.search(r["body"] or "")
+    ]
+    if reviews:
+        print("\nreview summaries (latest 8):")
+        for r in reviews[-8:]:
+            commit = ((r.get("commit") or {}).get("oid") or "")[:7]
+            print(f"  {who(r)[0]} {r['state'].lower()} on {commit}: {snippet(r['body'], 200)} {r['url']}")
+
+    talk = [
+        c for c in pr.comments
+        if who(c)[0] not in pr.mine and (not who(c)[1] or (review_bot(c) and not CODEX_STATE.search(c["body"] or "")))
+    ]
+    if talk:
+        print("\ntop-level comments (latest 8, bots other than review bots skipped):")
+        for c in talk[-8:]:
+            print(f"  {who(c)[0]} at {c['createdAt']}: {snippet(c['body'], 200)} {c['url']}")
+
+
+class Watcher:
+    def __init__(self, repo: str, pr: int, args: argparse.Namespace) -> None:
+        self.repo, self.pr = repo, pr
+        self.until: str = args.until
+        self.interval: int = max(args.interval, 10)
+        self.timeout: int = args.timeout
+        self.settle: int = args.settle
+        self.required_only: bool = args.required_only
+        self.ignore = [re.compile(p) for p in args.ignore_check]
+        self.started = time.time()
+        self.path = STATE_DIR / f"{repo.replace('/', '__')}__{pr}.json"
+        state = self.load()
+        # First run for this PR: record what exists and report nothing.
+        self.baseline = state is None
+        self.state: Json = state or {"reported": [], "base_oid": None, "merge_state": None, "head_seen": {}}
+        self.state.setdefault("head_seen", {})
+        self.reported: set[str] = set(self.state["reported"])
+        self.printed: set[str] = set()
+        self.events = 0
+        self.required: set[str] | None = None
+        self.prev_snapshot: list[tuple[str, str]] | None = None
+        self.pr_files: dict[str, set[str]] = {}
+
+    def load(self) -> Json | None:
+        try:
+            if time.time() - self.path.stat().st_mtime > STALE_STATE_SECONDS:
+                return None
+            return json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def save(self) -> None:
+        self.state["reported"] = sorted(self.reported)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.state))
+        tmp.replace(self.path)
+
+    def say(self, line: str) -> None:
+        if line not in self.printed:
+            self.printed.add(line)
+            print(f"#{self.pr} {line}", flush=True)
+
+    def emit(self, key: str, line: str) -> None:
+        """Print an event once per PR, across restarts."""
+        if key in self.reported:
+            return
+        self.reported.add(key)
+        if not self.baseline:
+            self.events += 1
+            self.say(line)
+
+    def finish(self, code: int, lines: Sequence[str] = ()) -> NoReturn:
+        for line in lines:
+            self.say(line)
+        self.save()
+        sys.exit(code)
+
+    def base_overlap(self, head: str, old: str, new: str) -> list[str]:
+        """Files this PR touches that the new base commits also touch."""
+        try:
+            if head not in self.pr_files:
+                self.pr_files[head] = set(gh_lines(["pr", "diff", str(self.pr), "-R", self.repo, "--name-only"]))
+            moved = gh_lines(["api", f"repos/{self.repo}/compare/{old}...{new}", "--jq", ".files[].filename"])
+        except GhError as error:
+            log(f"could not compare base commits: {error}")
+            return []
+        return sorted(self.pr_files[head].intersection(moved))
+
+    def poll(self) -> None:
+        pr = Pr(self.repo, self.pr)
+        raw = pr.raw
+        if raw["state"] == "MERGED":
+            self.finish(0, [f"merged: {raw['url']}"])
+        if raw["state"] == "CLOSED":
+            self.finish(1, [f"closed without merging: {raw['url']}"])
+
+        if self.required is None:
+            self.required = required_checks(self.repo, pr.base)
+            log(
+                f"watching {self.repo}#{self.pr} until {self.until}; required checks: "
+                f"{', '.join(sorted(self.required)) or 'none set'}"
+            )
+        head, short = pr.head, pr.short
+        now = time.time()
+        first_seen = self.state["head_seen"].setdefault(head, now)
+        self.events = 0
+
+        # Checks.
+        gate = pr.gate(self.required, self.required_only, self.ignore)
+        fail_lines: list[str] = []
+        for name in sorted(gate):
+            bucket = pr.bucket(name)
+            if bucket in FAILED:
+                c = pr.checks[name]
+                verb = "failed" if bucket == "fail" else "was cancelled"
+                fail_lines.append(f"check {verb}: {check_line(name, c, self.required)}")
+                self.emit(f"fail:{head}:{name}:{c['link']}", fail_lines[-1])
+        gate_done = all(pr.bucket(n) != "pending" for n in gate)
+        all_done = gate_done and all(c["bucket"] != "pending" for c in pr.checks.values())
+        # Checks appear a few seconds after a push. Two identical polls in a row
+        # guard against calling a half-registered set of checks finished.
+        snapshot = sorted((name, c["bucket"]) for name, c in pr.checks.items())
+        stable = snapshot == self.prev_snapshot
+        self.prev_snapshot = snapshot
+        green = gate_done and stable and not fail_lines
+
+        # People and bots talking. Edits are never events.
+        for comment in pr.comments:
+            login, is_bot = who(comment)
+            if login in pr.mine or CODEX_STATE.search(comment["body"] or ""):
+                continue
+            if is_bot and not review_bot(comment):
+                continue  # CI, deploy, and tracker bots: checks carry that news
+            self.emit(f"c:{comment['id']}", f"comment from {login}: {snippet(comment['body'])} {comment['url']}")
+        for review in pr.reviews:
+            login, _ = who(review)
+            body = review["body"] or ""
+            if login in pr.mine or CLAUDE_MANUAL.search(body):
+                continue
+            if review["state"] in ("APPROVED", "CHANGES_REQUESTED") or body.strip():
+                state = review["state"].lower().replace("_", " ")
+                self.emit(f"c:{review['id']}", f"review from {login} ({state}): {snippet(body)} {review['url']}")
+        for thread in pr.threads:
+            where = f"{thread['path']}:{thread['line']}" if thread["line"] else thread["path"]
+            for index, comment in enumerate(thread["comments"]["nodes"]):
+                login, _ = who(comment)
+                if login in pr.mine:
+                    continue
+                kind = "new thread" if index == 0 else "thread reply"
+                sev = severity(comment["body"]) if index == 0 else ""
+                self.emit(
+                    f"c:{comment['id']}",
+                    f"{kind} from {login} on {where}{f' [{sev}]' if sev else ''}: "
+                    f"{snippet(comment['body'])} (thread {thread['id']}) {comment['url']}",
+                )
+
+        # Review bots on the head.
+        bots = pr.bots()
+        busy = [b for b, (s, _) in bots.items() if s == "pending"]
+        for bot, (state, detail) in bots.items():
+            if state == "reviewed":
+                self.emit(f"bot:{bot}:{head}", f"{bot} finished on {short}: {detail}")
+
+        # Base branch and merge state.
+        base_oid, old_base = pr.base_oid, self.state["base_oid"]
+        if base_oid and old_base and base_oid != old_base and not self.baseline:
+            touched = self.base_overlap(head, old_base, base_oid)
+            if touched:
+                more = f" and {len(touched) - 5} more" if len(touched) > 5 else ""
+                self.emit(
+                    f"base:{base_oid}",
+                    f"{pr.base} moved to {base_oid[:7]} and touches files in this PR: {', '.join(touched[:5])}{more}",
+                )
+        if base_oid:
+            self.state["base_oid"] = base_oid
+        merge_state = raw["mergeStateStatus"]
+        dirty_line = f"merge state is DIRTY: the branch conflicts with {pr.base}"
+        behind_line = f"merge state is BEHIND: the branch is behind {pr.base}"
+        if merge_state != "UNKNOWN":
+            if merge_state in ("BEHIND", "DIRTY") and self.state["merge_state"] != merge_state:
+                line = dirty_line if merge_state == "DIRTY" else behind_line
+                self.emit(f"merge:{merge_state}:{head}:{base_oid}", line)
+            self.state["merge_state"] = merge_state
+
+        # Summary for this head.
+        counts: dict[str, int] = {}
+        for c in pr.checks.values():
+            counts[c["bucket"]] = counts.get(c["bucket"], 0) + 1
+        waiting = pr.awaiting_reply()
+        parts = [
+            ", ".join(f"{n} {b}" for b, n in sorted(counts.items())) or "no checks",
+            "; ".join(f"{b} {s}" for b, (s, _) in bots.items() if s != "absent"),
+            f"{len(waiting)} threads waiting on you",
+            f"merge state {merge_state}",
+        ]
+        summary = "; ".join(p for p in parts if p)
+
+        settled = now - first_seen >= self.settle
+        ready = green and not busy and settled
+        if self.until != "any-change" or self.events:
+            if merge_state == "DIRTY":
+                self.finish(1, [dirty_line])
+            if fail_lines:
+                self.finish(1, fail_lines)
+        if green and self.until == "green":
+            self.reported.add(f"checks:{head}")
+            self.finish(0, [f"green on {short}: {summary}"])
+        if ready:
+            if waiting:
+                urls = " ".join(t["comments"]["nodes"][-1]["url"] for t in waiting)
+                self.finish(1, [f"checks green on {short} but {len(waiting)} threads wait on you: {urls}"])
+            self.reported.add(f"checks:{head}")
+            self.finish(0, [f"ready on {short}: {summary}"])
+        if all_done and stable:
+            self.emit(f"checks:{head}", f"checks finished on {short}: {summary}")
+        if self.until == "any-change" and self.events:
+            self.finish(0)
+        if self.timeout and now - self.started >= self.timeout:
+            pending = sorted(n for n in gate if pr.bucket(n) == "pending")
+            waits = ", ".join(filter(None, [
+                f"checks {', '.join(pending[:5])}{' ...' if len(pending) > 5 else ''}" if pending else "",
+                f"bots {', '.join(busy)}" if busy else "",
+                "review bots to start (--settle)" if not settled else "",
+            ]))
+            self.finish(3, [f"timed out after {self.timeout}s on {short}; still waiting on {waits or 'the next poll'}"])
+
+    def run(self) -> NoReturn:
+        failures = 0
+        while True:
+            try:
+                self.poll()
+                failures = 0
+            except GhError as error:
+                if not error.transient:
+                    self.finish(1, [f"watcher stopped: {error}"])
+                failures += 1
+                log(f"poll failed ({failures}/{MAX_FAILED_POLLS}): {error}")
+                if failures >= MAX_FAILED_POLLS:
+                    self.finish(1, [f"watcher stopped: GitHub unreachable for {failures} polls: {error}"])
+            else:
+                self.save()
+                if self.baseline:
+                    log(f"baseline recorded for {self.repo}#{self.pr}; reporting only new events")
+                self.baseline = False
+            time.sleep(self.interval)
+
+
+def lock(repo: str, pr: int) -> Any:
+    """Hold a per-PR lock for the life of the process. The OS drops it on exit."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(STATE_DIR / f"{repo.replace('/', '__')}__{pr}.lock", "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        pid = handle.read().strip() or "unknown"
+        fail(
+            f"pid {pid} already watches {repo}#{pr}, so this watcher exits to avoid duplicate events. "
+            f"If no events reach you from it, run `kill {pid}` and start again."
+        )
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="pr-babysit", description="Read and watch a GitHub PR for an agent.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("status", "wait"):
+        p = sub.add_parser(name)
+        p.add_argument("pr", nargs="?", help="PR number or URL")
+        p.add_argument("--repo", help="owner/name (default: from the URL or the current checkout)")
+        if name == "wait":
+            p.add_argument("--until", choices=("ready", "green", "any-change"), default="ready")
+            p.add_argument("--timeout", type=int, default=0, help="exit 3 after this many seconds with nothing to act on (0 = never)")
+            p.add_argument("--interval", type=int, default=30, help="seconds between polls (default 30, min 10)")
+            p.add_argument("--settle", type=int, default=180, help="seconds a head must exist before it can be ready, so review bots can start (default 180)")
+            p.add_argument("--ignore-check", action="append", default=[], metavar="REGEX", help="never gate on checks matching this regex; repeatable")
+            p.add_argument("--required-only", action="store_true", help="gate only on checks the base branch requires")
+    args = parser.parse_args()
+    repo, pr = parse_target(args.pr, args.repo)
+    if args.command == "status":
+        try:
+            status(repo, pr)
+        except GhError as error:
+            fail(f"cannot read {repo}#{pr}: {error}", 1)
+        return
+    _lock = lock(repo, pr)
+    Watcher(repo, pr, args).run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
